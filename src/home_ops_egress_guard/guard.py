@@ -37,6 +37,7 @@ class GuardLimits:
     max_concurrency: int | None = None
     max_retries_per_item: int | None = None
     max_candidates_per_run: int | None = None
+    stale_attempt_secs: int | None = None
 
 
 @dataclass(frozen=True)
@@ -222,7 +223,50 @@ class EgressGuard:
             )
             if f"EGRESS_LIMIT_{provider_key}_{operation_key}_MAX_CANDIDATES_PER_RUN" in self.env
             else defaults.max_candidates_per_run,
+            stale_attempt_secs=_int_env(
+                self.env, f"EGRESS_LIMIT_{provider_key}_{operation_key}_STALE_ATTEMPT_SECS"
+            )
+            if f"EGRESS_LIMIT_{provider_key}_{operation_key}_STALE_ATTEMPT_SECS" in self.env
+            else defaults.stale_attempt_secs,
         )
+
+    def _expire_stale_attempts(
+        self,
+        conn: sqlite3.Connection,
+        provider: str,
+        operation: str,
+        stale_attempt_secs: int | None,
+    ) -> None:
+        if stale_attempt_secs is None:
+            return
+
+        finished_at = _now()
+        stale_before = finished_at - stale_attempt_secs
+        error = f"stale attempt recovered after exceeding {stale_attempt_secs}s"
+        cursor = conn.execute(
+            """
+            UPDATE egress_requests
+            SET status = 'failed', finished_at = ?, error = ?
+            WHERE provider = ?
+              AND operation = ?
+              AND status = 'attempted'
+              AND started_at < ?
+            """,
+            (finished_at, error, provider, operation, stale_before),
+        )
+        if cursor.rowcount:
+            log.warning(
+                "egress_guard_recovered_stale %s",
+                json.dumps(
+                    {
+                        "count": cursor.rowcount,
+                        "operation": operation,
+                        "provider": provider,
+                        "stale_attempt_secs": stale_attempt_secs,
+                    },
+                    sort_keys=True,
+                ),
+            )
 
     def check_candidates(self, provider: str, operation: str, count: int) -> None:
         limit = self.limits_for(provider, operation).max_candidates_per_run
@@ -395,6 +439,13 @@ class EgressGuard:
     ) -> RequestRecord:
         disabled_reason = self._disabled_reason(provider, operation)
         with self._connect() as conn:
+            limits = self.limits_for(provider, operation)
+            self._expire_stale_attempts(
+                conn,
+                provider,
+                operation,
+                limits.stale_attempt_secs,
+            )
             reason = disabled_reason or self._limit_reason(conn, provider, operation, item_key)
             if reason:
                 self._insert_request(

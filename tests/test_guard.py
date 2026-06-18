@@ -97,6 +97,46 @@ def test_concurrency_limit_blocks_open_attempt(tmp_path: Path) -> None:
         guard.start_request("provider", "op")
 
 
+def test_concurrency_limit_recovers_stale_attempt(tmp_path: Path) -> None:
+    guard = make_guard(
+        tmp_path,
+        limits={
+            ("provider", "op"): GuardLimits(
+                max_concurrency=1,
+                stale_attempt_secs=300,
+            )
+        },
+    )
+    guard.start_request("provider", "op")
+
+    with sqlite3.connect(tmp_path / "ledger.sqlite3") as conn:
+        conn.execute(
+            "UPDATE egress_requests SET started_at = started_at - 301 WHERE status = 'attempted'"
+        )
+
+    guard.start_request("provider", "op")
+
+    assert request_statuses(tmp_path / "ledger.sqlite3") == ["failed", "attempted"]
+
+
+def test_concurrency_limit_keeps_recent_attempt_open(tmp_path: Path) -> None:
+    guard = make_guard(
+        tmp_path,
+        limits={
+            ("provider", "op"): GuardLimits(
+                max_concurrency=1,
+                stale_attempt_secs=300,
+            )
+        },
+    )
+    guard.start_request("provider", "op")
+
+    with pytest.raises(EgressBlocked):
+        guard.start_request("provider", "op")
+
+    assert request_statuses(tmp_path / "ledger.sqlite3") == ["attempted", "blocked"]
+
+
 def test_retry_limit_blocks_by_item_key(tmp_path: Path) -> None:
     guard = make_guard(
         tmp_path,
